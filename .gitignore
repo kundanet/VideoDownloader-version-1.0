@@ -1,0 +1,10 @@
+deno.exe
+ffmpeg.exe
+ffprobe.exe
+yt-dlp.exe
+download_log.txt
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
