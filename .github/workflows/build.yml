@@ -33,14 +33,25 @@ jobs:
           --windowed --onedir --contents-directory .
           --name VideoDownloader Video_downloader.py
 
+      
       - name: Download existing tool bundle
         shell: pwsh
         run: |
-          $url = "https://github.com/kundanet/VideoDownloader-version-1.0/releases/download/v1.0.0/VideoDownloader-Windows.zip.zip"
+          $releaseUrl = "https://api.github.com/repos/kundanet/VideoDownloader-version-1.0/releases/tags/v1.0.0"
+          $release = Invoke-RestMethod -Uri $releaseUrl
+
+          $asset = $release.assets |
+            Where-Object { $_.name -like "VideoDownloader-Windows*.zip" } |
+            Select-Object -First 1
+
+          if (-not $asset) {
+            throw "Could not find the VideoDownloader ZIP in release v1.0.0."
+          }
+
           $zip = "$env:RUNNER_TEMP\tools.zip"
           $folder = "$env:RUNNER_TEMP\tools"
 
-          Invoke-WebRequest -Uri $url -OutFile $zip
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zip
           Expand-Archive -Path $zip -DestinationPath $folder -Force
 
           $destination = "dist\VideoDownloader"
