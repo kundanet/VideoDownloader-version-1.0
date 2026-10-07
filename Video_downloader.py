@@ -8,6 +8,10 @@ import json
 import queue
 import time
 import sys
+import socket
+import tempfile
+import urllib.error
+import urllib.request
 
 
 # ============================================================
@@ -18,11 +22,38 @@ import sys
 
 APP_TITLE = "Video Downloader"
 
+# Version of THIS application. Must match the GitHub release tag without the "v"
+# (release tag v1.0.1 -> "1.0.1"). Not related to the yt-dlp version.
+APP_VERSION = "1.0.1"
+GITHUB_REPO = "kundanet/VideoDownloader-version-1.0"
+RELEASES_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+RELEASES_PAGE_URL = f"https://github.com/{GITHUB_REPO}/releases/latest"
+UPDATE_CHECK_TIMEOUT = 10  # seconds
+APP_UPDATE_ASSET_NAME = "VideoDownloader-Windows.zip"
+APP_UPDATE_DOWNLOAD_TIMEOUT = 60  # seconds per network read
+APP_UPDATE_CHUNK_SIZE = 1024 * 256
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-YT_DLP = os.path.join(BASE_DIR, "yt-dlp.exe")
-FFMPEG = os.path.join(BASE_DIR, "ffmpeg.exe")
-FFPROBE = os.path.join(BASE_DIR, "ffprobe.exe")
-DENO = os.path.join(BASE_DIR, "deno.exe")
+
+# When running the Python source from the project root, the portable
+# dependencies may live in the PyInstaller output folder. When the app is
+# packaged, they are beside VideoDownloader.exe, so BASE_DIR is used.
+if getattr(sys, "frozen", False):
+    RESOURCE_DIR = BASE_DIR
+else:
+    _resource_candidates = [
+        BASE_DIR,
+        os.path.join(BASE_DIR, "dist", "VideoDownloader"),
+    ]
+    RESOURCE_DIR = next(
+        (p for p in _resource_candidates if os.path.exists(os.path.join(p, "yt-dlp.exe"))),
+        BASE_DIR,
+    )
+
+YT_DLP = os.path.join(RESOURCE_DIR, "yt-dlp.exe")
+FFMPEG = os.path.join(RESOURCE_DIR, "ffmpeg.exe")
+FFPROBE = os.path.join(RESOURCE_DIR, "ffprobe.exe")
+DENO = os.path.join(RESOURCE_DIR, "deno.exe")
 
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -155,6 +186,115 @@ def site_info(url):
             return name, color
     m = re.search(r"https?://(?:www\.)?([^/]+)", low)
     return (m.group(1) if m else "Link"), BLUE
+
+
+# ------------------------------------------------------------
+# App update check (GitHub Releases)
+# ------------------------------------------------------------
+
+_VERSION_RE = re.compile(r"^[vV]?(\d+(?:\.\d+){0,3})$")
+
+
+def parse_version(text):
+    """'v1.2.3' / '1.2.3' -> (1, 2, 3).  Anything else (e.g. '1.2.0-beta') -> None."""
+    m = _VERSION_RE.match((text or "").strip())
+    if not m:
+        return None
+    return tuple(int(x) for x in m.group(1).split("."))
+
+
+def compare_versions(a, b):
+    """Return 1 if a > b, 0 if equal, -1 if a < b, None if either cannot be compared safely."""
+    pa, pb = parse_version(a), parse_version(b)
+    if pa is None or pb is None:
+        return None
+    n = max(len(pa), len(pb))
+    pa += (0,) * (n - len(pa))
+    pb += (0,) * (n - len(pb))
+    return (pa > pb) - (pa < pb)
+
+
+def evaluate_update(latest_tag, current=None):
+    """'newer' | 'uptodate' | 'unknown' (latest tag has a format we cannot compare safely)."""
+    result = compare_versions(latest_tag, current or APP_VERSION)
+    if result is None:
+        return "unknown"
+    return "newer" if result > 0 else "uptodate"
+
+
+class UpdateCheckError(Exception):
+    """A problem checking for updates, with a message that is safe to show to the user."""
+
+
+def fetch_latest_release(api_url=None, timeout=UPDATE_CHECK_TIMEOUT):
+    """Ask the GitHub Releases API for the latest release.
+
+    Returns {"tag": "v1.0.1", "url": "https://github.com/..."}.
+    Raises UpdateCheckError with a friendly message on any failure.
+    """
+    req = urllib.request.Request(
+        api_url or RELEASES_API_URL,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": f"VideoDownloader/{APP_VERSION}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read(1024 * 1024)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise UpdateCheckError("No published release was found on GitHub yet.")
+        if exc.code in (403, 429):
+            raise UpdateCheckError("GitHub is limiting requests right now. Please try again in a few minutes.")
+        raise UpdateCheckError(f"GitHub returned an error (HTTP {exc.code}).")
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, (socket.timeout, TimeoutError)):
+            raise UpdateCheckError("The request timed out. Check your internet connection and try again.")
+        raise UpdateCheckError("Could not connect to GitHub. Check your internet connection.")
+    except (socket.timeout, TimeoutError):
+        raise UpdateCheckError("The request timed out. Check your internet connection and try again.")
+    except OSError:
+        raise UpdateCheckError("Could not connect to GitHub. Check your internet connection.")
+
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        raise UpdateCheckError("GitHub sent a response this app could not read.")
+    if not isinstance(data, dict) or not isinstance(data.get("tag_name"), str) or not data["tag_name"].strip():
+        raise UpdateCheckError("GitHub's response did not include a release version.")
+
+    url = data.get("html_url")
+    if not (isinstance(url, str) and url.startswith("https://github.com/")):
+        url = RELEASES_PAGE_URL
+
+    assets = data.get("assets")
+    if not isinstance(assets, list):
+        raise UpdateCheckError("GitHub's release did not include downloadable files.")
+
+    asset = next(
+        (a for a in assets
+         if isinstance(a, dict) and a.get("name") == APP_UPDATE_ASSET_NAME),
+        None,
+    )
+    asset_url = asset.get("browser_download_url") if isinstance(asset, dict) else None
+    if not (isinstance(asset_url, str) and asset_url.startswith("https://github.com/")):
+        raise UpdateCheckError(
+            f"The release does not contain the expected {APP_UPDATE_ASSET_NAME} file.")
+
+    size = asset.get("size") if isinstance(asset, dict) else None
+    try:
+        size = int(size) if size is not None else None
+    except (TypeError, ValueError):
+        size = None
+
+    return {
+        "tag": data["tag_name"].strip(),
+        "url": url,
+        "asset_name": APP_UPDATE_ASSET_NAME,
+        "asset_url": asset_url,
+        "asset_size": size,
+    }
 
 
 MAX_YT_VIDEOS = 200
@@ -351,7 +491,7 @@ def build_command(url, output_template, mode, quality, fmt, browser_cookies=None
             command += ["--cookies-from-browser", browser_cookies]
 
     if os.path.exists(FFMPEG):
-        command += ["--ffmpeg-location", BASE_DIR]
+        command += ["--ffmpeg-location", RESOURCE_DIR]
 
     if mode == "Audio":
         command += [
@@ -579,7 +719,7 @@ class DownloadCard(tk.Frame):
 class App:
     def __init__(self, root):
         self.root = root
-        root.title(APP_TITLE)
+        root.title(f"{APP_TITLE}  v{APP_VERSION}")
         root.geometry("1200x840")
         root.minsize(1060, 800)
         root.configure(bg=BG)
@@ -603,6 +743,7 @@ class App:
         self.ui_queue = queue.Queue()
         self.filter = "All"
         self.warned_optional = False
+        self.app_update_checking = False
 
         self.setup_style()
         self.build_header()
@@ -677,6 +818,10 @@ class App:
                                       width=140, height=34, radius=9,
                                       font=(FONT, 9, "bold"))
         self.update_btn.pack(side="right")
+        self.app_update_btn = RoundButton(inner, "Check for Updates", self.check_for_updates,
+                                          width=150, height=34, radius=9,
+                                          font=(FONT, 9, "bold"))
+        self.app_update_btn.pack(side="right", padx=(0, 10))
         tk.Label(inner, text="Ctrl + Enter  to start", font=(FONT, 9),
                  fg=MUTED, bg=SURFACE).pack(side="right", padx=(0, 16))
 
@@ -1342,6 +1487,312 @@ class App:
                 self.refresh_list()
             if status == "active":
                 self.scroll_to(card)
+
+    # --------------------------------------------------------
+    # App update (GitHub Releases)
+    # --------------------------------------------------------
+    def check_for_updates(self):
+        if self.app_update_checking:
+            return
+        if self.is_downloading:
+            messagebox.showinfo(
+                "Check for Updates",
+                "Press Stop or wait for the current download to finish first."
+            )
+            return
+        if not getattr(sys, "frozen", False):
+            messagebox.showinfo(
+                "Check for Updates",
+                "In-app updates are available in the packaged Windows EXE.\n\n"
+                "Run the released VideoDownloader.exe to test the updater."
+            )
+            return
+
+        self.app_update_checking = True
+        self.app_update_btn.set_enabled(False)
+        self.app_update_btn.set_text("Checking…")
+        self.set_status("Checking for app updates…", BLUE)
+        threading.Thread(target=self._app_update_worker, daemon=True).start()
+
+    def _app_update_worker(self):
+        try:
+            outcome = ("ok", fetch_latest_release())
+        except UpdateCheckError as exc:
+            outcome = ("error", str(exc))
+        except Exception as exc:
+            outcome = ("error", f"Unexpected problem: {exc}")
+        self.ui_queue.put((None, self._app_update_done, (outcome,)))
+
+    def _app_update_done(self, outcome):
+        self.app_update_checking = False
+        self.app_update_btn.set_enabled(True)
+        self.app_update_btn.set_text("Check for Updates")
+        self.root.after(30, lambda: self._show_update_result(outcome))
+
+    def _show_update_result(self, outcome):
+        kind, payload = outcome
+        title = "Check for Updates"
+        try:
+            if kind == "error":
+                if messagebox.askretrycancel(
+                        title, f"Could not check for updates.\n\n{payload}\n\nTry again?"):
+                    self.check_for_updates()
+                else:
+                    self.set_status("Update check failed", RED)
+                return
+
+            tag = payload["tag"]
+            latest = tag.lstrip("vV")
+            status = evaluate_update(tag)
+
+            if status == "newer":
+                if messagebox.askyesno(
+                        "Update available",
+                        "A newer version of Video Downloader is available.\n\n"
+                        f"Installed version:  {APP_VERSION}\n"
+                        f"Latest version:  {latest}\n\n"
+                        "Download and install it now?"):
+                    self._start_app_update(payload)
+                else:
+                    self.set_status("Update postponed", MUTED)
+            elif status == "uptodate":
+                messagebox.showinfo(
+                    title,
+                    "You're up to date!\n\n"
+                    f"Installed version:  {APP_VERSION}\n"
+                    f"Latest release:  {latest}")
+                self.set_status("Up to date", ACCENT)
+            else:
+                messagebox.showwarning(
+                    title,
+                    f"The latest GitHub release is tagged \"{tag}\", which this app "
+                    "cannot compare safely.\n\nPlease check the release manually.")
+                self.set_status("Could not compare release version", ORANGE)
+        except Exception as exc:
+            print("Update dialog problem:", exc)
+            self.set_status("Update check failed", RED)
+
+    def _start_app_update(self, release):
+        self.app_update_checking = True
+        self.app_update_btn.set_enabled(False)
+        self.app_update_btn.set_text("Downloading…")
+        self.set_status(f"Downloading Video Downloader {release['tag'].lstrip('vV')}…", BLUE)
+        threading.Thread(
+            target=self._app_update_download_worker,
+            args=(release,),
+            daemon=True,
+        ).start()
+
+    def _app_update_progress(self, percent, downloaded, total):
+        if total:
+            self.app_update_btn.set_text(f"Updating {percent:.0f}%")
+            self.set_status(
+                f"Downloading update… {percent:.0f}%  •  "
+                f"{self._format_bytes(downloaded)} / {self._format_bytes(total)}",
+                BLUE,
+            )
+        else:
+            self.app_update_btn.set_text("Downloading…")
+            self.set_status(
+                f"Downloading update… {self._format_bytes(downloaded)}",
+                BLUE,
+            )
+
+    @staticmethod
+    def _format_bytes(value):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return "0 B"
+        units = ("B", "KB", "MB", "GB")
+        for unit in units:
+            if value < 1024 or unit == units[-1]:
+                return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+            value /= 1024
+        return f"{value:.1f} GB"
+
+    def _app_update_download_worker(self, release):
+        temp_dir = None
+        try:
+            temp_dir = tempfile.mkdtemp(prefix="VideoDownloader-update-")
+            zip_path = os.path.join(temp_dir, release.get("asset_name", APP_UPDATE_ASSET_NAME))
+
+            req = urllib.request.Request(
+                release["asset_url"],
+                headers={
+                    "Accept": "application/octet-stream",
+                    "User-Agent": f"VideoDownloader/{APP_VERSION}",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=APP_UPDATE_DOWNLOAD_TIMEOUT) as resp:
+                total_header = resp.headers.get("Content-Length")
+                try:
+                    total = int(total_header) if total_header else int(release.get("asset_size") or 0)
+                except (TypeError, ValueError):
+                    total = 0
+
+                downloaded = 0
+                last_reported = -1
+                with open(zip_path, "wb") as out:
+                    while True:
+                        chunk = resp.read(APP_UPDATE_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        downloaded += len(chunk)
+                        if total:
+                            percent = min(100, downloaded * 100 / total)
+                            whole = int(percent)
+                            if whole != last_reported:
+                                last_reported = whole
+                                self.ui_queue.put((
+                                    None, self._app_update_progress,
+                                    (percent, downloaded, total),
+                                ))
+                        elif downloaded % (APP_UPDATE_CHUNK_SIZE * 4) == 0:
+                            self.ui_queue.put((
+                                None, self._app_update_progress,
+                                (0, downloaded, 0),
+                            ))
+
+            if not os.path.isfile(zip_path) or os.path.getsize(zip_path) < 1024:
+                raise UpdateCheckError("The downloaded update file is incomplete.")
+
+            self.ui_queue.put((None, self._app_update_download_done,
+                               ("ok", zip_path, temp_dir, release)))
+        except urllib.error.HTTPError as exc:
+            msg = f"GitHub returned an error while downloading the update (HTTP {exc.code})."
+            self.ui_queue.put((None, self._app_update_download_done,
+                               ("error", msg, temp_dir, release)))
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, (socket.timeout, TimeoutError)):
+                msg = "The update download timed out. Please try again."
+            else:
+                msg = "Could not download the update. Check your internet connection."
+            self.ui_queue.put((None, self._app_update_download_done,
+                               ("error", msg, temp_dir, release)))
+        except (socket.timeout, TimeoutError):
+            self.ui_queue.put((None, self._app_update_download_done,
+                               ("error", "The update download timed out. Please try again.", temp_dir, release)))
+        except Exception as exc:
+            self.ui_queue.put((None, self._app_update_download_done,
+                               ("error", f"Could not download the update.\n\n{exc}", temp_dir, release)))
+
+    def _app_update_download_done(self, outcome, path, temp_dir, release):
+        if outcome != "ok":
+            self.app_update_checking = False
+            self.app_update_btn.set_enabled(True)
+            self.app_update_btn.set_text("Check for Updates")
+            self.set_status("Update download failed", RED)
+            try:
+                if temp_dir and os.path.isdir(temp_dir):
+                    import shutil
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception:
+                pass
+            messagebox.showerror("Update failed", path)
+            return
+
+        try:
+            self._launch_app_updater(path, temp_dir, release)
+        except Exception as exc:
+            self.app_update_checking = False
+            self.app_update_btn.set_enabled(True)
+            self.app_update_btn.set_text("Check for Updates")
+            self.set_status("Could not start updater", RED)
+            messagebox.showerror(
+                "Update failed",
+                f"The update was downloaded, but the updater could not be started.\n\n{exc}",
+            )
+
+    @staticmethod
+    def _ps_quote(value):
+        return "'" + str(value).replace("'", "''") + "'"
+
+    def _launch_app_updater(self, zip_path, temp_dir, release):
+        if not getattr(sys, "frozen", False):
+            raise RuntimeError("In-app updating is only supported by the packaged Windows EXE.")
+        if os.name != "nt":
+            raise RuntimeError("In-app updating is currently supported on Windows only.")
+
+        install_dir = os.path.dirname(os.path.abspath(sys.executable))
+        target_exe = os.path.join(install_dir, os.path.basename(sys.executable))
+        pid = os.getpid()
+        stage_dir = os.path.join(temp_dir, "extracted")
+        script_path = os.path.join(temp_dir, "install_update.ps1")
+        log_path = os.path.join(temp_dir, "update.log")
+        temp_dir_ps = self._ps_quote(temp_dir)
+
+        script = f"""$ErrorActionPreference = \"Stop\"
+$tempDir = {temp_dir_ps}
+$pidToWait = {pid}
+$zipPath = {self._ps_quote(zip_path)}
+$stageDir = {self._ps_quote(stage_dir)}
+$installDir = {self._ps_quote(install_dir)}
+$targetExe = {self._ps_quote(target_exe)}
+$logPath = {self._ps_quote(log_path)}
+$version = {self._ps_quote(release.get("tag", "").lstrip("vV"))}
+
+function Log($message) {{
+    try {{ Add-Content -LiteralPath $logPath -Value (\"[\" + (Get-Date -Format s) + \"] \" + $message) }} catch {{}}
+}}
+
+try {{
+    Log \"Waiting for Video Downloader process $pidToWait to exit.\"
+    for ($i = 0; $i -lt 120; $i++) {{
+        if (-not (Get-Process -Id $pidToWait -ErrorAction SilentlyContinue)) {{ break }}
+        Start-Sleep -Milliseconds 250
+    }}
+    if (Get-Process -Id $pidToWait -ErrorAction SilentlyContinue) {{
+        throw \"The old Video Downloader process did not exit in time.\"
+    }}
+
+    if (-not (Test-Path -LiteralPath $zipPath)) {{ throw \"Downloaded update package was not found.\" }}
+    if (Test-Path -LiteralPath $stageDir) {{ Remove-Item -LiteralPath $stageDir -Recurse -Force }}
+    New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+
+    Log \"Extracting update package.\"
+    Expand-Archive -LiteralPath $zipPath -DestinationPath $stageDir -Force
+
+    $newExe = Get-ChildItem -LiteralPath $stageDir -Filter \"VideoDownloader.exe\" -File -Recurse | Select-Object -First 1
+    if (-not $newExe) {{ throw \"The update package does not contain VideoDownloader.exe.\" }}
+    $packageRoot = $newExe.Directory.FullName
+
+    if (-not (Test-Path -LiteralPath $installDir)) {{ throw \"The application folder no longer exists.\" }}
+    Log \"Copying update files from $packageRoot to $installDir.\"
+    Copy-Item -Path (Join-Path $packageRoot \"*\") -Destination $installDir -Recurse -Force
+
+    if (-not (Test-Path -LiteralPath $targetExe)) {{ throw \"The updated VideoDownloader.exe was not found after installation.\" }}
+    Log \"Starting Video Downloader $version.\"
+    Start-Process -FilePath $targetExe -WorkingDirectory $installDir
+    Log \"Update completed successfully.\"
+}} catch {{
+    Log (\"Update failed: \" + $_.Exception.Message)
+    try {{ Add-Type -AssemblyName PresentationFramework; [System.Windows.MessageBox]::Show(
+        \"Video Downloader could not finish the update.`n`n\" + $_.Exception.Message,
+        \"Update failed\", \"OK\", \"Error\") | Out-Null }} catch {{}}
+}} finally {{
+    Start-Sleep -Seconds 2
+    try {{ Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue }} catch {{}}
+}}
+"""
+        with open(script_path, "w", encoding="utf-8", newline="\r\n") as f:
+            f.write(script)
+
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
+        subprocess.Popen(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script_path],
+            cwd=install_dir,
+            creationflags=creationflags,
+            close_fds=True,
+        )
+
+        self.set_status(
+            f"Installing Video Downloader {release.get('tag', '').lstrip('vV')}… The app will restart.",
+            ACCENT,
+        )
+        self.app_update_btn.set_text("Installing…")
+        self.root.after(700, self.root.destroy)
 
     def fetch_version(self):
         ver = ""
