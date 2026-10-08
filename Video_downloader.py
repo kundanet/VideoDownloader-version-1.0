@@ -12,6 +12,7 @@ import socket
 import tempfile
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 # ============================================================
@@ -24,7 +25,7 @@ APP_TITLE = "Video Downloader"
 
 # Version of THIS application. Must match the GitHub release tag without the "v"
 # (release tag v1.0.1 -> "1.0.1"). Not related to the yt-dlp version.
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 GITHUB_REPO = "kundanet/VideoDownloader-version-1.0"
 RELEASES_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 RELEASES_PAGE_URL = f"https://github.com/{GITHUB_REPO}/releases/latest"
@@ -32,6 +33,10 @@ UPDATE_CHECK_TIMEOUT = 10  # seconds
 APP_UPDATE_ASSET_NAME = "VideoDownloader-Windows.zip"
 APP_UPDATE_DOWNLOAD_TIMEOUT = 60  # seconds per network read
 APP_UPDATE_CHUNK_SIZE = 1024 * 256
+
+# Run several independent yt-dlp jobs at the same time, like 4K Video Downloader.
+# Four is a good default for most connections; the OS/network can still limit speed.
+MAX_CONCURRENT_DOWNLOADS = 4
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -737,7 +742,8 @@ class App:
 
         self.cards = []
         self.is_downloading = False
-        self.current_process = None
+        self.current_processes = set()
+        self.current_processes_lock = threading.Lock()
         self.stop_event = threading.Event()
         self.batch_id = 0
         self.ui_queue = queue.Queue()
@@ -1446,8 +1452,10 @@ class App:
             return
         self.batch_id += 1          # invalidates any queued events from the old worker
         self.stop_event.set()
-        proc = self.current_process
-        if proc:
+        # Multiple yt-dlp processes may be running now. Stop all of them.
+        with self.current_processes_lock:
+            processes = list(self.current_processes)
+        for proc in processes:
             try:
                 proc.terminate()
             except Exception:
@@ -1867,8 +1875,8 @@ try {{
     # --------------------------------------------------------
     # Worker thread
     # --------------------------------------------------------
-    def run_download(self, bid, stop, card, command, pos, total):
-        # Runs one yt-dlp process, streams progress to the UI, returns (code, last_error, log_lines)
+    def run_download(self, bid, stop, card, command, pos, total, progress_state, progress_lock):
+        # Runs one yt-dlp process. Several instances can run concurrently.
         def post(fn, *args):
             self.ui_queue.put((bid, fn, args))
 
@@ -1877,7 +1885,11 @@ try {{
         proc = subprocess.Popen(
             command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             encoding="utf-8", errors="replace", bufsize=1, creationflags=NO_WINDOW)
-        self.current_process = proc
+
+        # Track every running process so Stop can terminate the whole batch.
+        with self.current_processes_lock:
+            self.current_processes.add(proc)
+
         try:
             for raw in proc.stdout:
                 if stop.is_set():
@@ -1901,18 +1913,27 @@ try {{
                 if progress:
                     percent, speed, eta = progress
                     post(self.apply_update, card, "active", percent, speed, eta)
-                    post(self.set_overall, (pos + percent / 100) / total * 100)
+                    with progress_lock:
+                        progress_state[card] = percent
+                        overall = sum(progress_state.values()) / total if total else 100
+                    post(self.set_overall, overall)
 
             code = proc.wait()
         finally:
-            if self.current_process is proc:
-                self.current_process = None
+            with self.current_processes_lock:
+                self.current_processes.discard(proc)
         return code, last_error, lines[-300:]
 
     def worker(self, bid, stop, batch, folder, mode, quality, fmt, browser, expand=None, net="Auto"):
+        # Download up to MAX_CONCURRENT_DOWNLOADS items at the same time.
+        # Each URL gets its own yt-dlp process, while Tkinter updates remain
+        # marshalled through the existing UI queue.
         completed = 0
         failed = 0
         used_names = set()
+        used_names_lock = threading.Lock()
+        progress_state = {card: 0.0 for card in batch}
+        progress_lock = threading.Lock()
 
         def post(fn, *args):
             self.ui_queue.put((bid, fn, args))
@@ -1935,34 +1956,37 @@ try {{
                 if stop.is_set():
                     return
             batch = holder["cards"]
-            post(self.set_status, f"Downloading {len(batch)} video(s)…", ORANGE)
+            progress_state = {card: 0.0 for card in batch}
+            post(self.set_status, f"Downloading {len(batch)} video(s) with up to {MAX_CONCURRENT_DOWNLOADS} at once…", ORANGE)
 
         total = len(batch)
+        if total == 0:
+            post(self.on_finished, 0, 0, 0)
+            return
+
         strategies = yt_strategies(quality)
         net_args = {"IPv4": ["--force-ipv4"], "IPv6": ["--force-ipv6"]}.get(net, [])
-        best_idx = 0
-        fail_streak = 0
 
-        for pos, card in enumerate(batch):
-            if stop.is_set():
-                break
-
+        def download_one(pos, card):
+            """Download one card independently so other cards keep running."""
             url = card.url
             last_error = ""
+            log_lines = []
+            used_idx = None
 
-            if pos > 0 and is_tiktok_url(url):
+            if is_tiktok_url(url) and pos > 0:
                 for _ in range(2):
                     if stop.is_set():
-                        break
+                        return False, "Stopped", []
                     time.sleep(1)
 
             post(self.apply_update, card, "active", 0, "--", "--", None, "Retrieving information…")
 
-            # Titles from the channel listing are reused (skips a slow lookup per video).
+            # Titles from channel listings are reused when available.
             known = getattr(card, "known", None)
             info = dict(known) if known else get_info(url, browser)
             if stop.is_set():
-                break
+                return False, "Stopped", []
 
             title_text = info.get("title", "") or ""
             if is_generic_title(title_text):
@@ -1976,32 +2000,29 @@ try {{
                 ext = "mp4"
 
             base_name = clean_filename(title_text) if title_text else f"Video {card.number}"
-            final_name = base_name
-            n = 1
-            while (final_name.lower() in used_names
-                   or os.path.exists(os.path.join(folder, f"{final_name}.{ext}"))):
-                final_name = f"{base_name} ({n})"
-                n += 1
-            used_names.add(final_name.lower())
+
+            # Reserve the filename atomically so simultaneous downloads never
+            # overwrite each other when titles are identical.
+            with used_names_lock:
+                final_name = base_name
+                n = 1
+                while (final_name.lower() in used_names
+                       or os.path.exists(os.path.join(folder, f"{final_name}.{ext}"))):
+                    final_name = f"{base_name} ({n})"
+                    n += 1
+                used_names.add(final_name.lower())
 
             output_template = os.path.join(folder, f"{final_name}.%(ext)s")
 
             site = info.get("extractor_key") or site_info(url)[0]
             parts = [site, info.get("uploader") or info.get("channel"), fmt_duration(info.get("duration"))]
             meta = "  •  ".join(str(p) for p in parts if p)
-
             post(self.apply_update, card, "active", 0, "--", "--", final_name, meta)
 
             youtube = is_youtube_url(url)
-            if youtube:
-                order = list(range(len(strategies)))
-                order = order[best_idx:] + order[:best_idx]   # start with what worked last
-                if fail_streak >= 2:
-                    order = order[:1]                          # don't waste time if nothing works
-            else:
-                order = [None]
+            order = list(range(len(strategies))) if youtube else [None]
 
-            code, last_error, log_lines, used_idx = -1, "", [], None
+            code = -1
             try:
                 for attempt, sidx in enumerate(order):
                     if stop.is_set():
@@ -2014,7 +2035,9 @@ try {{
                     command = build_command(url, output_template, mode, quality, fmt, browser)
                     command = command[:-3] + net_args + extra + command[-3:]
 
-                    code, last_error, lines = self.run_download(bid, stop, card, command, pos, total)
+                    code, last_error, lines = self.run_download(
+                        bid, stop, card, command, pos, total, progress_state, progress_lock
+                    )
                     log_lines += ["", f"=== attempt {attempt + 1}: {' '.join(extra) or 'default'} ==="] + lines
 
                     if code == 0:
@@ -2024,27 +2047,45 @@ try {{
                         break
 
                 if stop.is_set():
-                    break
+                    return False, "Stopped", log_lines
 
                 if code == 0:
-                    completed += 1
-                    fail_streak = 0
-                    if used_idx is not None:
-                        best_idx = used_idx
+                    with progress_lock:
+                        progress_state[card] = 100.0
+                    post(self.set_overall, sum(progress_state.values()) / total)
                     saved = (meta + "  •  " if meta else "") + "Saved"
                     post(self.apply_update, card, "done", 100, "--", "--", None, saved)
-                else:
-                    failed += 1
-                    fail_streak += 1
-                    reason = last_error or "yt-dlp could not download this URL"
-                    write_log(url, log_lines)
-                    post(self.apply_update, card, "failed", 0, "--", "--", None, reason)
+                    return True, "", log_lines
+
+                reason = last_error or "yt-dlp could not download this URL"
+                write_log(url, log_lines)
+                post(self.apply_update, card, "failed", 0, "--", "--", None, reason)
+                return False, reason, log_lines
 
             except Exception as exc:
-                failed += 1
-                post(self.apply_update, card, "failed", 0, "--", "--", None, f"Error: {exc}")
+                reason = f"Error: {exc}"
+                post(self.apply_update, card, "failed", 0, "--", "--", None, reason)
+                return False, reason, log_lines
 
-            post(self.set_overall, (pos + 1) / total * 100)
+        # The executor keeps several yt-dlp processes alive at once. The OS
+        # and internet connection still decide the actual bandwidth available.
+        workers = min(MAX_CONCURRENT_DOWNLOADS, total)
+        post(self.set_status, f"Downloading {total} item(s) • {workers} simultaneous downloads", ORANGE)
+
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="VideoDL") as executor:
+            futures = [executor.submit(download_one, pos, card) for pos, card in enumerate(batch)]
+            for future in as_completed(futures):
+                if stop.is_set():
+                    continue
+                try:
+                    ok, _, _ = future.result()
+                    if ok:
+                        completed += 1
+                    else:
+                        failed += 1
+                except Exception as exc:
+                    failed += 1
+                    post(self.set_status, f"Download worker error: {exc}", RED)
 
         if not stop.is_set():
             post(self.on_finished, completed, failed, total)
