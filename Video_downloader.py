@@ -10,6 +10,7 @@ import time
 import sys
 import socket
 import tempfile
+import shutil
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -25,7 +26,7 @@ APP_TITLE = "Video Downloader"
 
 # Version of THIS application. Must match the GitHub release tag without the "v"
 # (release tag v1.0.1 -> "1.0.1"). Not related to the yt-dlp version.
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 GITHUB_REPO = "kundanet/VideoDownloader-version-1.0"
 RELEASES_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 RELEASES_PAGE_URL = f"https://github.com/{GITHUB_REPO}/releases/latest"
@@ -36,7 +37,11 @@ APP_UPDATE_CHUNK_SIZE = 1024 * 256
 
 # Run several independent yt-dlp jobs at the same time, like 4K Video Downloader.
 # Four is a good default for most connections; the OS/network can still limit speed.
-MAX_CONCURRENT_DOWNLOADS = 4
+MAX_CONCURRENT_DOWNLOADS = 6
+
+# Number of HLS/DASH fragments to fetch concurrently per video.
+FRAGMENT_THREADS = 4
+FRAG_ARGS = ["--concurrent-fragments", str(FRAGMENT_THREADS)]
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -113,6 +118,56 @@ def is_tiktok_url(url):
     return bool(re.search(r"(?:https?://)?(?:www\.|m\.|vm\.|vt\.)?tiktok\.com/", url, re.I))
 
 
+def is_douyin_url(url):
+    return bool(re.search(r"(?:https?://)?(?:www\.)?douyin\.com/", url, re.I))
+
+
+def is_instagram_url(url):
+    return bool(re.search(r"(?:https?://)?(?:www\.)?instagram\.com/", url, re.I))
+
+
+def organize_instagram_files(staging_folder, download_folder):
+    """Move Instagram videos only into the Instagram Videos folder; ignore photos."""
+    video_exts = {".mp4", ".m4v", ".mov", ".webm", ".mkv"}
+    moved = 0
+    errors = []
+    destination_folder = os.path.join(download_folder, "Instagram Videos")
+
+    for root, _, files in os.walk(staging_folder):
+        for filename in files:
+            source = os.path.join(root, filename)
+            if os.path.splitext(filename)[1].lower() not in video_exts:
+                continue
+
+            try:
+                os.makedirs(destination_folder, exist_ok=True)
+                destination = os.path.join(destination_folder, filename)
+                base, suffix = os.path.splitext(filename)
+                counter = 1
+                while os.path.exists(destination):
+                    destination = os.path.join(destination_folder, f"{base} ({counter}){suffix}")
+                    counter += 1
+                shutil.move(source, destination)
+                moved += 1
+            except Exception as exc:
+                errors.append(f"Could not move {filename}: {exc}")
+
+    return moved, errors
+
+
+def normalize_douyin_url(url):
+    """Convert Douyin's jingxuan modal link to a standard video URL when possible."""
+    url = url.strip()
+    if not re.match(r"^https?://", url, re.I):
+        url = "https://" + url
+    if not is_douyin_url(url):
+        return url
+    match = re.search(r"[?&]modal_id=(\d+)", url, re.I)
+    if match and re.search(r"/jingxuan(?:[/?#]|$)", url, re.I):
+        return f"https://www.douyin.com/video/{match.group(1)}"
+    return url
+
+
 def dependency_status():
     return {
         "yt-dlp": os.path.exists(YT_DLP),
@@ -175,6 +230,7 @@ def fmt_duration(sec):
 SITES = [
     (r"youtube\.com|youtu\.be", "YouTube", "#ff4d4d"),
     (r"tiktok\.com", "TikTok", "#25f4ee"),
+    (r"douyin\.com", "Douyin", "#00c2b8"),
     (r"instagram\.com", "Instagram", "#e1306c"),
     (r"twitter\.com|(?<![a-z])x\.com", "X", "#c5ccd3"),
     (r"facebook\.com|fb\.watch", "Facebook", "#4d8dff"),
@@ -441,11 +497,11 @@ def get_info(url, use_browser_cookies=None):
     ]
     if os.path.exists(DENO):
         base += ["--js-runtimes", f"deno:{DENO}"]
-    if is_tiktok_url(url):
+    if is_tiktok_url(url) or is_douyin_url(url):
         base += tiktok_options()
 
     attempts.append(base + [url])
-    if is_tiktok_url(url) and use_browser_cookies:
+    if (is_tiktok_url(url) or is_douyin_url(url)) and use_browser_cookies:
         attempts.append(base + ["--cookies-from-browser", use_browser_cookies, url])
 
     for command in attempts:
@@ -473,7 +529,6 @@ def build_command(url, output_template, mode, quality, fmt, browser_cookies=None
         command += ["--js-runtimes", f"deno:{DENO}"]
 
     command += [
-        "--no-playlist",
         "--newline",
         "--verbose",
         "--retries", "10",
@@ -485,12 +540,20 @@ def build_command(url, output_template, mode, quality, fmt, browser_cookies=None
         "--trim-filenames", "180",
     ]
 
+    # Instagram posts/carousels may mix photos and videos. Keep playlist support,
+    # skip entries without downloadable video formats, and continue to later videos.
+    if is_instagram_url(url):
+        command += ["--yes-playlist", "--ignore-errors", "--ignore-no-formats-error"]
+    else:
+        command += ["--no-playlist"]
+
     if is_youtube_url(url):
-        command += ["--sleep-interval", "1", "--max-sleep-interval", "3"]
+        # Avoid an unnecessary delay before each YouTube video. If YouTube rate-limits
+        # requests, reduce parallel downloads or restore a short sleep here.
         if browser_cookies:
             command += ["--cookies-from-browser", browser_cookies]
 
-    if is_tiktok_url(url):
+    if is_tiktok_url(url) or is_douyin_url(url):
         command += tiktok_options()
         if browser_cookies:
             command += ["--cookies-from-browser", browser_cookies]
@@ -505,15 +568,23 @@ def build_command(url, output_template, mode, quality, fmt, browser_cookies=None
             "--audio-format", "mp3" if fmt == "MP3" else "m4a",
         ]
     else:
-        heights = {"2160p (4K)": 2160, "1440p": 1440, "1080p": 1080, "720p": 720, "480p": 480}
-        h = heights.get(quality)
-        selector = f"bv*[height<={h}]+ba/b[height<={h}]" if h else "bv*+ba/b"
-        command += ["-f", selector]
+        if is_instagram_url(url):
+            # `best` can select image entries in a mixed carousel; the usual
+            # video-only + audio selector fails on photo slides with no video.
+            command += ["-f", "best"]
+        else:
+            heights = {"2160p (4K)": 2160, "1440p": 1440, "1080p": 1080, "720p": 720, "480p": 480}
+            h = heights.get(quality)
+            selector = f"bv*[height<={h}]+ba/b[height<={h}]" if h else "bv*+ba/b"
+            command += ["-f", selector]
 
-        if fmt == "MP4":
-            command += ["--merge-output-format", "mp4"]
-        elif fmt == "WEBM":
-            command += ["--merge-output-format", "webm"]
+        # Only force a container merge for video-oriented non-Instagram URLs.
+        # Instagram carousel entries can be JPEG/WEBP photos as well as videos.
+        if not is_instagram_url(url):
+            if fmt == "MP4":
+                command += ["--merge-output-format", "mp4"]
+            elif fmt == "WEBM":
+                command += ["--merge-output-format", "webm"]
 
     command += ["-o", output_template, url]
     return command
@@ -735,6 +806,7 @@ class App:
         self.format_var = tk.StringVar(value="MP4")
         self.cookies_var = tk.StringVar(value="Off")
         self.net_var = tk.StringVar(value="Auto")
+        self.parallel_var = tk.StringVar(value=str(MAX_CONCURRENT_DOWNLOADS))
         self.platform_var = tk.StringVar(value="YouTube")
         self.yt_var = tk.StringVar(value="")
         self.limit_var = tk.StringVar(value=str(MAX_YT_VIDEOS))
@@ -932,7 +1004,7 @@ class App:
         # Platform selector
         tk.Label(left, text="Platform", font=(FONT, 12, "bold"), fg=TEXT, bg=SURFACE).pack(
             anchor="w", padx=20, pady=(16, 8))
-        Segmented(left, ["YouTube", "TikTok", "Other"], self.platform_var,
+        Segmented(left, ["YouTube", "TikTok", "Douyin", "Instagram", "Other"], self.platform_var,
                   self.on_platform_change).pack(fill="x", padx=20)
 
         # Input area (swapped depending on platform) — takes whatever space is left
@@ -1014,6 +1086,14 @@ class App:
                 self.multi_hint.config(text="Paste TikTok links — one per line")
                 self.idle_btn_text = "⬇   DOWNLOAD TIKTOKS"
                 self.cookie_frame.pack(fill="x", after=self.opts_grid)
+            elif p == "Douyin":
+                self.multi_hint.config(text="Paste Douyin video/share links — one per line")
+                self.idle_btn_text = "⬇   DOWNLOAD DOUYIN"
+                self.cookie_frame.pack(fill="x", after=self.opts_grid)
+            elif p == "Instagram":
+                self.multi_hint.config(text="Paste Instagram video, Reel, or carousel links — videos only. Filenames use the post title, like TikTok.")
+                self.idle_btn_text = "⬇   DOWNLOAD INSTAGRAM VIDEOS"
+                self.cookie_frame.pack(fill="x", after=self.opts_grid)
             else:
                 self.multi_hint.config(text="Any site yt-dlp supports — one per line")
                 self.idle_btn_text = "⬇   DOWNLOAD ALL"
@@ -1047,6 +1127,11 @@ class App:
         tk.Label(srow, text="Save to", font=(FONT, 9), fg=MUTED, bg=SURFACE).pack(side="left", padx=(0, 10))
         RoundButton(srow, "Browse", self.choose_folder, width=76, height=32, radius=9,
                     font=(FONT, 9, "bold")).pack(side="right", padx=(8, 0))
+        self.parallel_combo = ttk.Combobox(
+            srow, textvariable=self.parallel_var, width=3, state="readonly", style="Dark.TCombobox",
+            values=[str(n) for n in (1, 2, 3, 4, 5, 6, 8, 10, 12, 16)])
+        self.parallel_combo.pack(side="right", padx=(8, 0))
+        tk.Label(srow, text="Parallel", font=(FONT, 9), fg=MUTED, bg=SURFACE).pack(side="right", padx=(14, 0))
         tk.Entry(srow, textvariable=self.download_folder, font=(FONT, 9), fg=TEXT, bg=SURFACE_3,
                  insertbackground=TEXT, relief="flat", highlightthickness=1,
                  highlightbackground=BORDER, highlightcolor=ACCENT
@@ -1382,6 +1467,34 @@ class App:
                     return
                 urls = good
 
+        if platform == "Douyin":
+            good = [normalize_douyin_url(u) for u in urls if is_douyin_url(u)]
+            skipped = len(urls) - len(good)
+            if skipped:
+                if not good:
+                    messagebox.showwarning("Douyin", "None of these look like Douyin links.")
+                    return
+                if not messagebox.askyesno(
+                        "Douyin",
+                        f"{skipped} link(s) are not Douyin links and will be skipped.\n\nContinue?"):
+                    return
+            urls = good
+
+        if platform == "Instagram":
+            good = [u for u in urls if is_instagram_url(u)]
+            skipped = len(urls) - len(good)
+            if skipped:
+                if not good:
+                    messagebox.showwarning(
+                        "Instagram", "None of these look like Instagram links.\n\n"
+                        "Paste a profile link like https://www.instagram.com/username/ or an individual post/Reel link.")
+                    return
+                if not messagebox.askyesno(
+                        "Instagram",
+                        f"{skipped} link(s) are not Instagram links and will be skipped.\n\nContinue?"):
+                    return
+            urls = good
+
         for c in self.cards:
             c.destroy()
         self.cards.clear()
@@ -1430,6 +1543,10 @@ class App:
         fmt = self.format_var.get()
         browser = self.cookies_var.get()
         net = self.net_var.get()
+        try:
+            parallel = max(1, min(16, int(self.parallel_var.get())))
+        except (ValueError, AttributeError):
+            parallel = MAX_CONCURRENT_DOWNLOADS
         if browser == "Off" or self.platform_var.get() == "Other":
             browser = None
 
@@ -1443,7 +1560,7 @@ class App:
 
         threading.Thread(
             target=self.worker,
-            args=(bid, self.stop_event, batch, folder, mode, quality, fmt, browser, expand, net),
+            args=(bid, self.stop_event, batch, folder, mode, quality, fmt, browser, expand, net, parallel),
             daemon=True,
         ).start()
 
@@ -1882,6 +1999,7 @@ try {{
 
         lines = []
         last_error = ""
+        last_pct, last_post = -1.0, 0.0
         proc = subprocess.Popen(
             command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             encoding="utf-8", errors="replace", bufsize=1, creationflags=NO_WINDOW)
@@ -1912,11 +2030,14 @@ try {{
 
                 if progress:
                     percent, speed, eta = progress
-                    post(self.apply_update, card, "active", percent, speed, eta)
-                    with progress_lock:
-                        progress_state[card] = percent
-                        overall = sum(progress_state.values()) / total if total else 100
-                    post(self.set_overall, overall)
+                    now = time.time()
+                    if percent >= 100 or abs(percent - last_pct) >= 1 or now - last_post >= 0.4:
+                        last_pct, last_post = percent, now
+                        post(self.apply_update, card, "active", percent, speed, eta)
+                        with progress_lock:
+                            progress_state[card] = percent
+                            overall = sum(progress_state.values()) / total if total else 100
+                        post(self.set_overall, overall)
 
             code = proc.wait()
         finally:
@@ -1924,7 +2045,8 @@ try {{
                 self.current_processes.discard(proc)
         return code, last_error, lines[-300:]
 
-    def worker(self, bid, stop, batch, folder, mode, quality, fmt, browser, expand=None, net="Auto"):
+    def worker(self, bid, stop, batch, folder, mode, quality, fmt, browser, expand=None, net="Auto",
+               parallel=MAX_CONCURRENT_DOWNLOADS):
         # Download up to MAX_CONCURRENT_DOWNLOADS items at the same time.
         # Each URL gets its own yt-dlp process, while Tkinter updates remain
         # marshalled through the existing UI queue.
@@ -1932,7 +2054,7 @@ try {{
         failed = 0
         used_names = set()
         used_names_lock = threading.Lock()
-        progress_state = {card: 0.0 for card in batch}
+        progress_state = {card: 0.0 for card in (batch or [])}
         progress_lock = threading.Lock()
 
         def post(fn, *args):
@@ -1957,7 +2079,7 @@ try {{
                     return
             batch = holder["cards"]
             progress_state = {card: 0.0 for card in batch}
-            post(self.set_status, f"Downloading {len(batch)} video(s) with up to {MAX_CONCURRENT_DOWNLOADS} at once…", ORANGE)
+            post(self.set_status, f"Downloading {len(batch)} video(s) with up to {parallel} at once…", ORANGE)
 
         total = len(batch)
         if total == 0:
@@ -1966,19 +2088,32 @@ try {{
 
         strategies = yt_strategies(quality)
         net_args = {"IPv4": ["--force-ipv4"], "IPv6": ["--force-ipv6"]}.get(net, [])
+        ladder = {"best": 0, "streak": 0}
+        ladder_lock = threading.Lock()
+
+        start_gate = threading.Lock()
+        start_state = {"t": 0.0}
 
         def download_one(pos, card):
             """Download one card independently so other cards keep running."""
+            if stop.is_set():
+                return False, "Stopped", []
             url = card.url
             last_error = ""
             log_lines = []
             used_idx = None
 
-            if is_tiktok_url(url) and pos > 0:
-                for _ in range(2):
-                    if stop.is_set():
-                        return False, "Stopped", []
-                    time.sleep(1)
+            # Stagger starts slightly to avoid sending a burst of requests to a site.
+            gap = 0.6 if (is_tiktok_url(url) or is_douyin_url(url)) else 0.2
+            while not stop.is_set():
+                with start_gate:
+                    wait = start_state["t"] + gap - time.time()
+                    if wait <= 0:
+                        start_state["t"] = time.time()
+                        break
+                time.sleep(min(wait, 0.25))
+            if stop.is_set():
+                return False, "Stopped", []
 
             post(self.apply_update, card, "active", 0, "--", "--", None, "Retrieving information…")
 
@@ -2012,7 +2147,20 @@ try {{
                     n += 1
                 used_names.add(final_name.lower())
 
-            output_template = os.path.join(folder, f"{final_name}.%(ext)s")
+            instagram = is_instagram_url(url) and mode != "Audio"
+            staging_folder = None
+            if instagram:
+                staging_folder = os.path.join(
+                    folder, f".instagram_temp_{card.number}_{time.time_ns()}"
+                )
+                os.makedirs(staging_folder, exist_ok=True)
+                # Use the post/video title like TikTok. Playlist index keeps multiple
+                # videos from the same carousel from overwriting each other.
+                output_template = os.path.join(
+                    staging_folder, "%(title).180B_%(playlist_index)s.%(ext)s"
+                )
+            else:
+                output_template = os.path.join(folder, f"{final_name}.%(ext)s")
 
             site = info.get("extractor_key") or site_info(url)[0]
             parts = [site, info.get("uploader") or info.get("channel"), fmt_duration(info.get("duration"))]
@@ -2020,7 +2168,14 @@ try {{
             post(self.apply_update, card, "active", 0, "--", "--", final_name, meta)
 
             youtube = is_youtube_url(url)
-            order = list(range(len(strategies))) if youtube else [None]
+            if youtube:
+                with ladder_lock:
+                    order = list(range(len(strategies)))
+                    order = order[ladder["best"]:] + order[:ladder["best"]]
+                    if ladder["streak"] >= 2:
+                        order = order[:1]
+            else:
+                order = [None]
 
             code = -1
             try:
@@ -2033,7 +2188,7 @@ try {{
                              f"Retrying with another method ({attempt}/{len(order) - 1})…")
 
                     command = build_command(url, output_template, mode, quality, fmt, browser)
-                    command = command[:-3] + net_args + extra + command[-3:]
+                    command = command[:-3] + FRAG_ARGS + (net_args if youtube else []) + extra + command[-3:]
 
                     code, last_error, lines = self.run_download(
                         bid, stop, card, command, pos, total, progress_state, progress_lock
@@ -2050,26 +2205,63 @@ try {{
                     return False, "Stopped", log_lines
 
                 if code == 0:
+                    if used_idx is not None:
+                        with ladder_lock:
+                            ladder["best"] = used_idx
+                            ladder["streak"] = 0
+
+                    if instagram and staging_folder:
+                        try:
+                            moved, organize_errors = organize_instagram_files(
+                                staging_folder, folder
+                            )
+                            log_lines.extend(organize_errors)
+                            if moved == 0:
+                                reason = (
+                                    "Download finished, but no supported Instagram photo/video "
+                                    "files were found to organize."
+                                )
+                                if organize_errors:
+                                    reason += " " + "; ".join(organize_errors[:3])
+                                write_log(url, log_lines)
+                                post(self.apply_update, card, "failed", 0, "--", "--", None, reason)
+                                return False, reason, log_lines
+                            log_lines.append(f"Instagram media organized: {moved} file(s)")
+                            write_log(url, log_lines)
+                        finally:
+                            if os.path.isdir(staging_folder):
+                                shutil.rmtree(staging_folder, ignore_errors=True)
+
                     with progress_lock:
                         progress_state[card] = 100.0
                     post(self.set_overall, sum(progress_state.values()) / total)
                     saved = (meta + "  •  " if meta else "") + "Saved"
+                    if instagram:
+                        saved += " • Instagram media organized"
                     post(self.apply_update, card, "done", 100, "--", "--", None, saved)
                     return True, "", log_lines
 
+                if staging_folder and os.path.isdir(staging_folder):
+                    shutil.rmtree(staging_folder, ignore_errors=True)
+
                 reason = last_error or "yt-dlp could not download this URL"
+                if youtube:
+                    with ladder_lock:
+                        ladder["streak"] += 1
                 write_log(url, log_lines)
                 post(self.apply_update, card, "failed", 0, "--", "--", None, reason)
                 return False, reason, log_lines
 
             except Exception as exc:
+                if staging_folder and os.path.isdir(staging_folder):
+                    shutil.rmtree(staging_folder, ignore_errors=True)
                 reason = f"Error: {exc}"
                 post(self.apply_update, card, "failed", 0, "--", "--", None, reason)
                 return False, reason, log_lines
 
         # The executor keeps several yt-dlp processes alive at once. The OS
         # and internet connection still decide the actual bandwidth available.
-        workers = min(MAX_CONCURRENT_DOWNLOADS, total)
+        workers = max(1, min(int(parallel), total))
         post(self.set_status, f"Downloading {total} item(s) • {workers} simultaneous downloads", ORANGE)
 
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="VideoDL") as executor:
